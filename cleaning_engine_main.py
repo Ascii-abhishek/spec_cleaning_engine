@@ -1,13 +1,11 @@
 import logging
 import re
 import shutil
+from typing import Any, Dict, List, Tuple
 from pathlib import Path
-from typing import Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
-
-from ce_helpers import *
+from .ce_helpers import *
 
 
 def _calculate_mixed_fraction_value(
@@ -145,7 +143,7 @@ def clean_numerical_unit(
         raise KeyError(f"Input DataFrame must contain '{value_column}' column.")
 
     df_working = df.copy()
-    pattern: re.Pattern = get_compiled_regex("numeric_with_optional_unit")
+    pattern = get_compiled_regex("numeric_with_optional_unit")
     extracted = df_working[value_column].astype(str).str.extract(pattern)
     extracted.columns = [
         "sign",
@@ -285,7 +283,7 @@ def clean_dimension_values(
     # drop helper cols *before* handing to numeric cleaner
     exploded.drop(columns=["_parts", "_has_sep", "_orig_index"], inplace=True)
 
-    passed_df, mod_df, remaining_df = clean_numerical_unit(exploded, value_column=value_column, logger=logger)
+    passed_df, mod_df, remaining_df = clean_numerical_unit(exploded, value_column=value_column)
 
     # Restore original attribute_value ------------------------------------------------
     for _df in (passed_df, mod_df, remaining_df):
@@ -295,6 +293,62 @@ def clean_dimension_values(
 
     logger.info(
         f"Finished clean_dimension_values: {len(passed_df)} passed, "
+        f"{len(mod_df)} had errors, {len(remaining_df)} did not match."
+    )
+
+    return passed_df, mod_df, remaining_df
+
+
+def clean_tolerance_values(
+    df: pd.DataFrame,
+    unit_df: pd.DataFrame,
+    value_column: str = "attribute_value",
+    logger: logging.Logger = logging.getLogger(__name__),
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Cleans tolerance values like '+/- 0.05"' into a standardized range format.
+    """
+    logger.info(f"Starting clean_tolerance_values on {len(df)} rows.")
+    if df.empty:
+        logger.warning("Input DataFrame for tolerance cleaning is empty.")
+        return df, pd.DataFrame(columns=df.columns), df
+
+    pattern = get_compiled_regex("tolerance")
+
+    # Ensure value column is string for regex matching
+    df_work = df.copy()
+    df_work[value_column] = df_work[value_column].astype(str)
+
+    # Rows that do not match the tolerance pattern
+    match_mask = df_work[value_column].str.contains(pattern, na=False)
+    remaining_df = df_work[~match_mask].copy()
+
+    # Rows that match the pattern
+    to_process_df = df_work[match_mask].copy()
+
+    if to_process_df.empty:
+        logger.info("No rows matched the tolerance pattern.")
+        return pd.DataFrame(columns=df.columns), pd.DataFrame(columns=df.columns), remaining_df
+
+    logger.info(f"{len(to_process_df)} rows matched the tolerance pattern.")
+
+    # Extract value and unit from matching rows
+    extracted_parts = to_process_df[value_column].str.extract(pattern)
+    to_process_df["value1"] = pd.to_numeric(extracted_parts[0], errors="coerce")
+    to_process_df["unit1"] = extracted_parts[1].str.strip()
+
+    # Create the range representation
+    to_process_df["value2"] = to_process_df["value1"]
+    to_process_df["unit2"] = to_process_df["unit1"]
+    to_process_df["polarity1"] = "-"
+    to_process_df["polarity2"] = "+"
+    to_process_df["data_type"] = "range1"
+
+    # Clean up the processed range values
+    passed_df, mod_df = cleanup_range(to_process_df, unit_df, logger)
+
+    logger.info(
+        f"Finished clean_tolerance_values: {len(passed_df)} passed, "
         f"{len(mod_df)} had errors, {len(remaining_df)} did not match."
     )
 
@@ -332,7 +386,7 @@ def clean_range_with_to_and_plus_minus(
         )
 
     passed_df, mod_df, remaining_df = clean_dimension_values(
-        df, separators=[" to ", ","], value_column=value_column, logger=logger
+        df, separators=[" to ", "/", " / "], value_column=value_column, logger=logger
     )
 
     # If no passed rows, return empty range_df plus mod and remaining as-is
@@ -381,10 +435,114 @@ def clean_range_with_to_and_plus_minus(
     return range_clean_pass, mod_df, remaining_df
 
 
+def clean_varchar_and_categorical(
+    df: pd.DataFrame,
+    value_column: str = "attribute_value",
+    logger: logging.Logger = logging.getLogger(__name__),
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Cleans non-numeric, varchar, and categorical values.
+
+    - Rows with digits are moved to `remaining_df`.
+    - Rows with commas are split, exploded, and classified as 'categorical2'.
+    - Rows without commas are classified as 'categorical' (<=3 words) or 'varchar' (>3 words).
+
+    Returns a tuple of DataFrames: (passed_df, modified_for_error_df, remaining_df).
+    """
+    logger.info(f"Starting clean_varchar_and_categorical on {len(df)} rows.")
+
+    if df.empty:
+        logger.warning("Input DataFrame is empty.")
+        cols = list(df.columns)
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
+
+    # Ensure value column is string type for reliable processing
+    df_work = df.copy()
+    df_work[value_column] = df_work[value_column].astype(str)
+
+    # Filter out rows containing any digit
+    has_digit_mask = df_work[value_column].str.contains(r"\d", na=False)
+    remaining_df = df_work[has_digit_mask].copy()
+    to_process_df = df_work[~has_digit_mask].copy()
+
+    logger.info(f"{len(remaining_df)} rows contain digits and are moved to remaining.")
+    logger.info(f"{len(to_process_df)} rows to be processed for categorical/varchar.")
+
+    passed_frames = []
+
+    # Process rows with commas
+    has_comma_mask = to_process_df[value_column].str.contains(",", na=False)
+    with_comma_df = to_process_df[has_comma_mask].copy()
+    without_comma_df = to_process_df[~has_comma_mask].copy()
+
+    if not with_comma_df.empty:
+        logger.info(f"Processing {len(with_comma_df)} rows with commas.")
+        with_comma_df["_orig_attr"] = with_comma_df[value_column]
+        with_comma_df["_orig_index"] = with_comma_df.index
+
+        # Explode into multiple rows
+        with_comma_df["value1"] = with_comma_df[value_column].str.split(",")
+        exploded_comma = with_comma_df.explode("value1")
+        exploded_comma["value1"] = exploded_comma["value1"].str.strip()
+
+        # Set key_value and data_type
+        exploded_comma["key_value"] = exploded_comma["_orig_index"]
+        exploded_comma["data_type"] = "categorical2"
+        exploded_comma[value_column] = exploded_comma["_orig_attr"]
+        exploded_comma.drop(columns=["_orig_attr", "_orig_index"], inplace=True)
+
+        passed_frames.append(exploded_comma)
+        logger.info(f"Exploded {len(with_comma_df)} rows into {len(exploded_comma)} categorical2 rows.")
+
+    # Process rows without commas
+    if not without_comma_df.empty:
+        logger.info(f"Processing {len(without_comma_df)} rows without commas.")
+        word_counts = without_comma_df[value_column].str.split().str.len()
+
+        # Categorical: 3 or less words
+        categorical_mask = word_counts <= 3
+        categorical_df = without_comma_df[categorical_mask].copy()
+        if not categorical_df.empty:
+            categorical_df["data_type"] = "categorical"
+            categorical_df["value1"] = categorical_df[value_column]
+            passed_frames.append(categorical_df)
+            logger.info(f"Classified {len(categorical_df)} rows as 'categorical'.")
+
+        # Varchar: 4 or more words
+        varchar_mask = word_counts >= 4
+        varchar_df = without_comma_df[varchar_mask].copy()
+        if not varchar_df.empty:
+            varchar_df["data_type"] = "varchar"
+            varchar_df["value1"] = varchar_df[value_column]
+            passed_frames.append(varchar_df)
+            logger.info(f"Classified {len(varchar_df)} rows as 'varchar'.")
+
+    # Combine all passed rows
+    if passed_frames:
+        passed_df = pd.concat(passed_frames, ignore_index=True)
+    else:
+        passed_df = pd.DataFrame(columns=df.columns)
+
+    # For this function, we don't have explicit error modifications, so mod_df is empty
+    mod_df = pd.DataFrame(columns=df.columns)
+
+    # Ensure all DataFrames have standard columns before returning
+    passed_df = check_required_columns(passed_df, logger)
+    mod_df = check_required_columns(mod_df, logger)
+    remaining_df = check_required_columns(remaining_df, logger)
+
+    logger.info(
+        f"Finished clean_varchar_and_categorical: {len(passed_df)} passed, "
+        f"{len(mod_df)} had errors, {len(remaining_df)} remaining."
+    )
+    return passed_df, mod_df, remaining_df
+
+
 def run_cleanup_pipeline(
     raw_df: pd.DataFrame,
     unit_df: pd.DataFrame,
     base_dir: str = ".",
+    logger: logging.Logger = logging.getLogger(__name__),
 ) -> None:
     """Run the full CE cleanup pipeline and materialise intermediate outputs.
 
@@ -393,7 +551,9 @@ def run_cleanup_pipeline(
       2. clean_numerical_unit
       3. clean_thread
       4. clean_dimension_values
-      5. clean_range_with_to_and_plus_minus
+      5. clean_tolerance_values
+      6. clean_range_with_to_and_plus_minus
+      7. clean_varchar_and_categorical
 
     *passed* frames go to ``<base_dir>/passed``; *mod* frames (including the final
     *remain*) to ``<base_dir>/mod``.
@@ -402,9 +562,6 @@ def run_cleanup_pipeline(
     if Path(base_dir).exists():
         shutil.rmtree(base_dir)
     Path(base_dir).mkdir(parents=True, exist_ok=True)
-
-    logging_path = Path(base_dir) / "cleanup_engine.log"
-    logger = setup_file_logger(logging_path, "cleaning_engine")
 
     logger.info(f"Starting cleanup pipeline with base directory: {base_dir}")
     logger.info(f"Input DataFrame has {len(raw_df)} rows and {len(raw_df.columns)} columns.")
@@ -416,22 +573,31 @@ def run_cleanup_pipeline(
     remain = df_after_start
 
     # 1 – numerical units -------------------------------------------------------
-    passed, mod, remain = clean_numerical_unit(remain, logger=logger)
+    passed, mod, remain = clean_numerical_unit(remain)
     save_dfs("clean_numerical_unit", passed, mod, base_dir)
 
     # 2 – thread spec filter ----------------------------------------------------
-    passed, mod, remain = clean_thread(remain, logger=logger)
+    passed, mod, remain = clean_thread(remain)
     save_dfs("clean_thread", passed, mod, base_dir)
 
     # 3 – dimension (X × Y) values --------------------------------------------
-    passed, mod, remain = clean_dimension_values(remain, logger=logger)
+    passed, mod, remain = clean_dimension_values(remain)
     save_dfs("clean_dimension_values", passed, mod, base_dir)
 
-    # 4 – ranges ("100 to 200") ------------------------------------------------
-    passed, mod, remain = clean_range_with_to_and_plus_minus(remain, unit_df, logger=logger)
+    # 4 - tolerance values (+/-) ---------------------------------------------
+    passed, mod, remain = clean_tolerance_values(remain, unit_df)
+    save_dfs("clean_tolerance_values", passed, mod, base_dir)
+
+    # 5 – ranges ("100 to 200") ------------------------------------------------
+    passed, mod, remain = clean_range_with_to_and_plus_minus(remain, unit_df)
     save_dfs("clean_range_with_to_and_plus_minus", passed, mod, base_dir)
 
-    # 5 – whatever is *still* left becomes final remain and is saved as mod -----
+    # 6 – varchar and categorical ----------------------------------------------
+    passed, mod, remain = clean_varchar_and_categorical(remain)
+    save_dfs("clean_varchar_and_categorical", passed, mod, base_dir)
+
+    # 7 – whatever is *still* left becomes final remain and is saved as mod -----
     if not remain.empty:
+        remain["mod_reason"] = "final_unprocessed"
         remain_path = os.path.join(base_dir, "mod", "final_remain.csv")
         remain.to_csv(remain_path, index=False)
