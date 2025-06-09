@@ -1,7 +1,8 @@
 import logging
-import os
-import re
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
+import os, re
+from typing import Any, List, Tuple
+
 import numpy as np
 import pandas as pd
 
@@ -263,3 +264,22 @@ def save_dfs(func_name: str, passed_df: pd.DataFrame, mod_df: pd.DataFrame, base
     if mod_df is not None and not mod_df.empty:
         mod_path = os.path.join(base_dir, "mod", f"{func_name}_mod.csv")
         mod_df.to_csv(mod_path, index=False)
+
+
+def setup_file_logger(file_path: Path, logger_name: str) -> logging.Logger:
+    """Sets up a file logger."""
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.DEBUG)  # Set the lowest logging level
+    
+    # Create file handler
+    file_handler = logging.FileHandler(file_path)
+    file_handler.setLevel(logging.DEBUG)
+    
+    # Create formatter and add it to the handler
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    
+    # Add the handler to the logger
+    logger.addHandler(file_handler)
+    
+    return logger

@@ -1,12 +1,13 @@
 import logging
 import re
 import shutil
-from typing import Any, Dict, List, Tuple
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from .ce_helpers import *
+
+from ce_helpers import *
 
 
 def _calculate_mixed_fraction_value(
@@ -144,7 +145,7 @@ def clean_numerical_unit(
         raise KeyError(f"Input DataFrame must contain '{value_column}' column.")
 
     df_working = df.copy()
-    pattern = get_compiled_regex("numeric_with_optional_unit")
+    pattern: re.Pattern = get_compiled_regex("numeric_with_optional_unit")
     extracted = df_working[value_column].astype(str).str.extract(pattern)
     extracted.columns = [
         "sign",
@@ -226,7 +227,7 @@ def clean_thread(
     logger: logging.Logger = logging.getLogger(__name__),
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
-    logger.info(f"Starting clean_numerical_unit on {len(df)} rows.")
+    logger.info(f"Starting clean_thread on {len(df)} rows.")
     if df.empty:
         logger.info(f"Empty df found!")
         cols = list(df.columns)
@@ -284,7 +285,7 @@ def clean_dimension_values(
     # drop helper cols *before* handing to numeric cleaner
     exploded.drop(columns=["_parts", "_has_sep", "_orig_index"], inplace=True)
 
-    passed_df, mod_df, remaining_df = clean_numerical_unit(exploded, value_column=value_column)
+    passed_df, mod_df, remaining_df = clean_numerical_unit(exploded, value_column=value_column, logger=logger)
 
     # Restore original attribute_value ------------------------------------------------
     for _df in (passed_df, mod_df, remaining_df):
@@ -331,7 +332,7 @@ def clean_range_with_to_and_plus_minus(
         )
 
     passed_df, mod_df, remaining_df = clean_dimension_values(
-        df, separators=[" to ", "/", " / "], value_column=value_column, logger=logger
+        df, separators=[" to ", ","], value_column=value_column, logger=logger
     )
 
     # If no passed rows, return empty range_df plus mod and remaining as-is
@@ -384,7 +385,6 @@ def run_cleanup_pipeline(
     raw_df: pd.DataFrame,
     unit_df: pd.DataFrame,
     base_dir: str = ".",
-    logger: logging.Logger = logging.getLogger(__name__),
 ) -> None:
     """Run the full CE cleanup pipeline and materialise intermediate outputs.
 
@@ -403,6 +403,9 @@ def run_cleanup_pipeline(
         shutil.rmtree(base_dir)
     Path(base_dir).mkdir(parents=True, exist_ok=True)
 
+    logging_path = Path(base_dir) / "cleanup_engine.log"
+    logger = setup_file_logger(logging_path, "cleaning_engine")
+
     logger.info(f"Starting cleanup pipeline with base directory: {base_dir}")
     logger.info(f"Input DataFrame has {len(raw_df)} rows and {len(raw_df.columns)} columns.")
 
@@ -413,19 +416,19 @@ def run_cleanup_pipeline(
     remain = df_after_start
 
     # 1 – numerical units -------------------------------------------------------
-    passed, mod, remain = clean_numerical_unit(remain)
+    passed, mod, remain = clean_numerical_unit(remain, logger=logger)
     save_dfs("clean_numerical_unit", passed, mod, base_dir)
 
     # 2 – thread spec filter ----------------------------------------------------
-    passed, mod, remain = clean_thread(remain)
+    passed, mod, remain = clean_thread(remain, logger=logger)
     save_dfs("clean_thread", passed, mod, base_dir)
 
     # 3 – dimension (X × Y) values --------------------------------------------
-    passed, mod, remain = clean_dimension_values(remain)
+    passed, mod, remain = clean_dimension_values(remain, logger=logger)
     save_dfs("clean_dimension_values", passed, mod, base_dir)
 
     # 4 – ranges ("100 to 200") ------------------------------------------------
-    passed, mod, remain = clean_range_with_to_and_plus_minus(remain, unit_df)
+    passed, mod, remain = clean_range_with_to_and_plus_minus(remain, unit_df, logger=logger)
     save_dfs("clean_range_with_to_and_plus_minus", passed, mod, base_dir)
 
     # 5 – whatever is *still* left becomes final remain and is saved as mod -----
